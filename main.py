@@ -1,8 +1,11 @@
+
 import cv2
-import torch
 import numpy as np
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
+import kagglehub
+import os
+
 
 # ---------------------------
 # Calibration (semi-automatic using lane markers)
@@ -35,9 +38,24 @@ def calibrate_lane_width(frame, lane_width_m=3.5):
 # ---------------------------
 # Main Vehicle Detection + Tracking
 # ---------------------------
+
 def main(video_source=0):
-    # Load YOLOv8 model
-    model = YOLO("yolov8n.pt")  # replace with fine-tuned weights
+
+    # Load YOLOv8 face detection model (model.pt from HuggingFace or yolov8n-face.pt)
+    face_model_path = os.path.join(os.getcwd(), "model.pt")
+    if not os.path.exists(face_model_path):
+        print("YOLOv8 face model 'model.pt' not found! Please place it in the project directory.")
+        face_model = None
+    else:
+        face_model = YOLO(face_model_path)
+
+    # Download and load human detection model from KaggleHub
+    human_model_path = kagglehub.model_download("thanh309/yolo11-human-detection/pyTorch/default")
+    human_model_file = os.path.join(human_model_path, "human-detection.pt")
+    human_model = YOLO(human_model_file)
+
+    # Load YOLOv8 vehicle model (make sure yolov8n.pt is in your project directory)
+    vehicle_model = YOLO("yolov8n.pt")
 
     # DeepSORT tracker
     tracker = DeepSort(max_age=30)
@@ -53,24 +71,43 @@ def main(video_source=0):
     mpp = calibrate_lane_width(frame)
     print(f"Calibration: {mpp:.5f} meters per pixel")
 
-
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Detect vehicles
-        results = model(frame, verbose=False)[0]
-
         detections = []
-        for box in results.boxes:
+
+
+
+        # Detect vehicles
+        vehicle_results = vehicle_model(frame, verbose=False)[0]
+        for box in vehicle_results.boxes:
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
             conf = float(box.conf[0])
             cls = int(box.cls[0])
-            label = model.names[cls]
-
-            if label in ["car", "truck", "bus", "motorbike"]:  # filter
+            label = vehicle_model.names[cls]
+            if label in ["car", "truck", "bus", "motorbike"]:
                 detections.append(([x1, y1, x2 - x1, y2 - y1], conf, label))
+
+        # Detect humans
+        human_results = human_model(frame, verbose=False)[0]
+        for box in human_results.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            conf = float(box.conf[0])
+            cls = int(box.cls[0])
+            label = human_model.names[cls] if hasattr(human_model, 'names') else "person"
+            if label == "person" or label == 0 or label == "human":
+                detections.append(([x1, y1, x2 - x1, y2 - y1], conf, "person"))
+
+        # Detect faces using YOLOv8 face model
+        if face_model is not None:
+            face_results = face_model(frame, verbose=False)[0]
+            for box in face_results.boxes:
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                conf = float(box.conf[0])
+                # Accept all detections as face
+                detections.append(([x1, y1, x2 - x1, y2 - y1], conf, "face"))
 
         # Update tracker
         tracks = tracker.update_tracks(detections, frame=frame)
@@ -81,20 +118,22 @@ def main(video_source=0):
             track_id = t.track_id
             ltrb = t.to_ltrb()
             x1, y1, x2, y2 = map(int, ltrb)
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            label = t.get_det_class() if t.get_det_class() else "object"
 
-            label = t.get_det_class() if t.get_det_class() else "vehicle"
-
-
-            # Draw bounding box + speed
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            # Draw bounding box + label
+            if label == "person":
+                color = (0, 0, 255)  # Red for person
+            elif label == "face":
+                color = (255, 0, 255)  # Magenta for face
+            else:
+                color = (0, 255, 0)  # Green for vehicles
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(frame, f"ID {track_id} {label}",
                         (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7, (0, 255, 255), 2)
+                        0.7, color, 2)
 
-        cv2.imshow("Vehicle Detection", frame)
+        cv2.imshow("Detection (Vehicle + Human)", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
-
             break
 
     cap.release()
